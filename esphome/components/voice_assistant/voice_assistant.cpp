@@ -10,6 +10,7 @@
 
 #include <cinttypes>
 #include <cstdio>
+#include <cstring>
 
 #if defined(USE_MICRO_WAKE_WORD) && defined(USE_VOICE_ASSISTANT_RUNTIME_MODEL)
 #include "esphome/components/micro_wake_word/model_data.h"
@@ -45,6 +46,11 @@ static const uint32_t AUDIO_CHANNEL_STALL_TIMEOUT_MS = 2000;
 VoiceAssistant::VoiceAssistant() { global_voice_assistant = this; }
 
 void VoiceAssistant::setup() {
+#if defined(USE_MICRO_WAKE_WORD) && defined(USE_VOICE_ASSISTANT_RUNTIME_MODEL)
+  // Read the stored wake word slots before any configuration request can consult them.
+  this->load_runtime_slots_();
+#endif
+
   this->mic_source_->add_data_callback([this](const std::vector<uint8_t> &data) {
     std::shared_ptr<ring_buffer::RingBuffer> temp_ring_buffer = this->ring_buffer_.lock();
     if (temp_ring_buffer != nullptr) {
@@ -1122,8 +1128,19 @@ void VoiceAssistant::on_set_configuration(const std::vector<std::string> &active
     // (above); switching back to an evicted model re-downloads it. get_runtime_model_ids() returns a copy,
     // so removing while iterating is safe.
     for (const auto &id : this->micro_wake_word_->get_runtime_model_ids()) {
-      if (std::find(active_wake_words.begin(), active_wake_words.end(), id) == active_wake_words.end()) {
-        this->micro_wake_word_->remove_runtime_model(id);
+      if (std::find(active_wake_words.begin(), active_wake_words.end(), id) == active_wake_words.end() &&
+          !this->micro_wake_word_->remove_runtime_model(id)) {
+        // The model stays loaded (but disabled) until a later request manages to unload it.
+        ESP_LOGW(TAG, "Could not unload runtime model %s; its memory stays in use for now", id.c_str());
+      }
+    }
+
+    // Release the slot of every wake word Home Assistant did not ask for, so what is stored is what it wants.
+    for (size_t slot = 0; slot < RUNTIME_WAKE_WORD_SLOTS; slot++) {
+      const char *slot_id = this->runtime_wake_word_slots_.ids[slot];
+      if (slot_id[0] != '\0' &&
+          std::find(active_wake_words.begin(), active_wake_words.end(), slot_id) == active_wake_words.end()) {
+        this->clear_runtime_slot_(slot);
       }
     }
 #endif
@@ -1148,6 +1165,12 @@ void VoiceAssistant::on_set_configuration(const std::vector<std::string> &active
       CachedExternalWakeWord *cached = this->find_cached_wake_word_(ww_id);
       if (cached == nullptr) {
         ESP_LOGE(TAG, "Unknown wake word ID: %s", ww_id.c_str());
+        continue;
+      }
+      // Reserve the slot that will remember this choice before the download starts: the model is built
+      // against the slot's preference key, so without one there is nowhere to record that it is on.
+      if (this->claim_runtime_slot_(ww_id) == RUNTIME_WAKE_WORD_SLOTS) {
+        ESP_LOGE(TAG, "Cannot activate %s: both runtime wake word slots are in use", ww_id.c_str());
         continue;
       }
       if (!this->is_wake_word_pending_(ww_id)) {
@@ -1249,6 +1272,8 @@ constexpr size_t MAX_SLIDING_WINDOW_SIZE = 50;
 constexpr size_t MAX_TENSOR_ARENA_SIZE = 1024 * 1024;
 // A hex-encoded SHA256 is always 64 characters. Anything else cannot be parsed for comparison.
 constexpr size_t SHA256_HEX_LENGTH = 64;
+// Home Assistant sends its whole catalogue on every request, so bound what the device is willing to hold.
+constexpr size_t MAX_EXTERNAL_WAKE_WORDS = 16;
 
 // Verifies a buffer against an expected hex-encoded SHA256. A free function (not a method) so it can never
 // read VoiceAssistant state, and so the hasher stays within a single stack frame as the hardware-accelerated
@@ -1317,6 +1342,17 @@ void VoiceAssistant::cache_external_wake_words_(const std::vector<api::VoiceAssi
                static_cast<int>(ww.id.size()), ww.id.c_str());
       continue;
     }
+    // The id has to fit a slot, which is what remembers the user's choice across a reboot.
+    if (ww.id.size() >= MAX_WAKE_WORD_ID_LENGTH) {
+      ESP_LOGW(TAG, "Ignoring external wake word %.*s: id is longer than %zu characters",
+               static_cast<int>(ww.id.size()), ww.id.c_str(), MAX_WAKE_WORD_ID_LENGTH - 1);
+      continue;
+    }
+    if (this->external_wake_words_cache_.size() >= MAX_EXTERNAL_WAKE_WORDS) {
+      ESP_LOGW(TAG, "Ignoring external wake word %.*s: already holding %zu", static_cast<int>(ww.id.size()),
+               ww.id.c_str(), MAX_EXTERNAL_WAKE_WORDS);
+      continue;
+    }
     // Copy every StringRef into an owning string; the proto StringRefs point into the receive buffer and
     // dangle once this handler returns.
     CachedExternalWakeWord entry;
@@ -1337,29 +1373,39 @@ void VoiceAssistant::remove_stale_runtime_models_() {
   // arenas, and the PSRAM model buffer. The enabled preference is deliberately left alone: if HA ever
   // advertises the wake word again, restore_runtime_models_ re-downloads it in the state the user left it.
   for (const auto &id : this->micro_wake_word_->get_runtime_model_ids()) {
-    if (this->find_cached_wake_word_(id) == nullptr) {
-      this->micro_wake_word_->remove_runtime_model(id);
+    if (this->find_cached_wake_word_(id) == nullptr && !this->micro_wake_word_->remove_runtime_model(id)) {
+      // The inference task missed its pause handshake. The model stays loaded and keeps being advertised
+      // until the next request tries again, so say so rather than leaving the log silent about it.
+      ESP_LOGW(TAG, "Could not unload stale runtime model %s; retrying on the next configuration request", id.c_str());
     }
   }
 }
 
 void VoiceAssistant::restore_runtime_models_() {
-  for (const auto &cached_ww : this->external_wake_words_cache_) {
+  for (size_t slot = 0; slot < RUNTIME_WAKE_WORD_SLOTS; slot++) {
+    const std::string id(this->runtime_wake_word_slots_.ids[slot]);
+    if (id.empty()) {
+      continue;
+    }
     // Skip anything already loaded or already queued/downloading.
-    if (this->micro_wake_word_->get_model_by_id(cached_ww.id) != nullptr || this->is_wake_word_pending_(cached_ww.id)) {
+    if (this->micro_wake_word_->get_model_by_id(id) != nullptr || this->is_wake_word_pending_(id)) {
+      continue;
+    }
+    const CachedExternalWakeWord *cached = this->find_cached_wake_word_(id);
+    if (cached == nullptr) {
+      // Not advertised at the moment. Keep the slot: the user has not changed their mind, and Home Assistant
+      // may offer the wake word again. claim_runtime_slot_ reuses the slot if something else needs one.
       continue;
     }
 
-    // Only re-download models the user had enabled before the reboot. Read the key directly: make_preference
-    // allocates a backend that is never freed, and this runs for every advertised model on every request.
+    // Only re-download what the user had turned on.
     bool enabled = false;
-    if (global_preferences->load_from_key(micro_wake_word::WakeWordModel::enabled_preference_key(cached_ww.id),
-                                          reinterpret_cast<uint8_t *>(&enabled), sizeof(enabled)) &&
-        enabled) {
-      ESP_LOGD(TAG, "Restoring runtime model %s", cached_ww.id.c_str());
-      this->model_download_queue_.push_back(cached_ww);
-      this->pending_active_wake_words_.push_back(cached_ww.id);
+    if (!this->runtime_slot_enabled_prefs_[slot].load(&enabled) || !enabled) {
+      continue;
     }
+    ESP_LOGD(TAG, "Restoring runtime model %s", id.c_str());
+    this->model_download_queue_.push_back(*cached);
+    this->pending_active_wake_words_.push_back(id);
   }
 
   this->try_start_model_load_task_();
@@ -1386,13 +1432,120 @@ void VoiceAssistant::erase_pending_wake_word_(const std::string &id) {
   }
 }
 
-void VoiceAssistant::mark_model_load_failed_(const std::string &id) {
-  // Persist disabled so a broken model isn't retried on every boot, and drop the optimistic active entry so
-  // HA sees the real (inactive) state.
-  auto pref = global_preferences->make_preference<bool>(micro_wake_word::WakeWordModel::enabled_preference_key(id));
-  bool enabled = false;
-  pref.save(&enabled);
+const char *VoiceAssistant::runtime_slot_id_(size_t slot) {
+  // The leading underscore keeps these clear of a real wake word id, which Home Assistant takes from the stem
+  // of a file in its custom_wake_words directory.
+  static constexpr const char *slot_ids[RUNTIME_WAKE_WORD_SLOTS] = {"_ww_slot_0", "_ww_slot_1"};
+  return slot_ids[slot];
+}
+
+void VoiceAssistant::load_runtime_slots_() {
+  this->runtime_wake_word_slots_pref_ =
+      global_preferences->make_preference<RuntimeWakeWordSlots>(fnv1_hash("voice_assistant_ww_slots"));
+  for (size_t slot = 0; slot < RUNTIME_WAKE_WORD_SLOTS; slot++) {
+    this->runtime_slot_enabled_prefs_[slot] = global_preferences->make_preference<bool>(
+        micro_wake_word::WakeWordModel::enabled_preference_key(VoiceAssistant::runtime_slot_id_(slot)));
+  }
+  if (!this->runtime_wake_word_slots_pref_.load(&this->runtime_wake_word_slots_)) {
+    this->runtime_wake_word_slots_ = {};
+    return;
+  }
+  // A record written by another build could be missing its terminator; make every slot a safe C string.
+  for (auto &id : this->runtime_wake_word_slots_.ids) {
+    id[MAX_WAKE_WORD_ID_LENGTH - 1] = '\0';
+  }
+}
+
+void VoiceAssistant::save_runtime_slots_() {
+  this->runtime_wake_word_slots_pref_.save(&this->runtime_wake_word_slots_);
+}
+
+size_t VoiceAssistant::find_runtime_slot_(const std::string &id) const {
+  for (size_t slot = 0; slot < RUNTIME_WAKE_WORD_SLOTS; slot++) {
+    const char *slot_id = this->runtime_wake_word_slots_.ids[slot];
+    if (slot_id[0] != '\0' && id == slot_id) {
+      return slot;
+    }
+  }
+  return RUNTIME_WAKE_WORD_SLOTS;
+}
+
+size_t VoiceAssistant::claim_runtime_slot_(const std::string &id) {
+  size_t slot = this->find_runtime_slot_(id);
+  if (slot < RUNTIME_WAKE_WORD_SLOTS) {
+    this->set_runtime_slot_enabled_(slot, true);
+    return slot;  // Already has one.
+  }
+  for (size_t candidate = 0; candidate < RUNTIME_WAKE_WORD_SLOTS; candidate++) {
+    if (this->runtime_wake_word_slots_.ids[candidate][0] == '\0') {
+      slot = candidate;
+      break;
+    }
+  }
+  if (slot == RUNTIME_WAKE_WORD_SLOTS) {
+    // Both taken. Reuse one whose wake word Home Assistant no longer advertises: it can never be downloaded
+    // again, so holding the slot for it would lock the user out of choosing something that can.
+    for (size_t candidate = 0; candidate < RUNTIME_WAKE_WORD_SLOTS; candidate++) {
+      if (this->find_cached_wake_word_(this->runtime_wake_word_slots_.ids[candidate]) == nullptr) {
+        slot = candidate;
+        break;
+      }
+    }
+  }
+  if (slot == RUNTIME_WAKE_WORD_SLOTS) {
+    return slot;
+  }
+  std::strncpy(this->runtime_wake_word_slots_.ids[slot], id.c_str(), MAX_WAKE_WORD_ID_LENGTH - 1);
+  this->runtime_wake_word_slots_.ids[slot][MAX_WAKE_WORD_ID_LENGTH - 1] = '\0';
+  this->save_runtime_slots_();
+  // A slot is only ever claimed because Home Assistant asked for this wake word, so record that it is wanted
+  // now rather than when the download lands: a reboot mid-download must still restore the user's choice.
+  this->set_runtime_slot_enabled_(slot, true);
+  return slot;
+}
+
+void VoiceAssistant::set_runtime_slot_enabled_(size_t slot, bool enabled) {
+  this->runtime_slot_enabled_prefs_[slot].save(&enabled);
+}
+
+void VoiceAssistant::clear_runtime_slot_(size_t slot) {
+  if (slot >= RUNTIME_WAKE_WORD_SLOTS || this->runtime_wake_word_slots_.ids[slot][0] == '\0') {
+    return;
+  }
+  this->runtime_wake_word_slots_.ids[slot][0] = '\0';
+  this->save_runtime_slots_();
+}
+
+void VoiceAssistant::abandon_runtime_model_(const std::string &id) {
+  ESP_LOGW(TAG, "Giving up on wake word %s", id.c_str());
+  const size_t slot = this->find_runtime_slot_(id);
+  if (slot < RUNTIME_WAKE_WORD_SLOTS) {
+    // Persist the slot as off before releasing it, so a reboot does not restore a wake word that just failed
+    // to load, and Home Assistant's select reads as no wake word rather than one that is not running.
+    this->set_runtime_slot_enabled_(slot, false);
+    this->clear_runtime_slot_(slot);
+  }
   this->erase_pending_wake_word_(id);
+  this->enable_fallback_model_();
+}
+
+void VoiceAssistant::enable_fallback_model_() {
+  for (auto *model : this->micro_wake_word_->get_wake_words()) {
+    if (model->is_enabled()) {
+      return;  // Something is still listening.
+    }
+  }
+  const std::vector<std::string> runtime_ids = this->micro_wake_word_->get_runtime_model_ids();
+  for (auto *model : this->micro_wake_word_->get_wake_words()) {
+    // Only a compiled-in model is a dependable fallback: a downloaded one can be unloaded again at any point.
+    if (std::find(runtime_ids.begin(), runtime_ids.end(), model->get_id()) != runtime_ids.end()) {
+      continue;
+    }
+    model->enable();
+    ESP_LOGW(TAG, "Falling back to wake word %s", model->get_id().c_str());
+    return;
+  }
+  ESP_LOGW(TAG, "No wake word is running: there is no compiled-in model to fall back to");
 }
 
 void VoiceAssistant::try_start_model_load_task_() {
@@ -1427,7 +1580,7 @@ void VoiceAssistant::try_start_model_load_task_() {
     this->model_load_task_handle_ = nullptr;
     // We're on the main loop: do the failure bookkeeping inline for every queued model.
     for (const auto &cached_ww : params->models_to_load) {
-      this->mark_model_load_failed_(cached_ww.id);
+      this->abandon_runtime_model_(cached_ww.id);
     }
     delete params;
     return;
@@ -1447,8 +1600,8 @@ void VoiceAssistant::model_load_task(void *params) {
     const std::string id = cached_ww.id;
     ESP_LOGD(TAG, "Processing model: %s", id.c_str());
 
-    // Shared failure step: persist disabled and drop the optimistic active entry, both on the main loop.
-    auto fail = [this_va, id]() { this_va->defer([this_va, id]() { this_va->mark_model_load_failed_(id); }); };
+    // Shared failure step, run on the main loop: release the slot and fall back to a compiled-in wake word.
+    auto fail = [this_va, id]() { this_va->defer([this_va, id]() { this_va->abandon_runtime_model_(id); }); };
 
     // 1. Download the manifest.
     auto manifest_container = this_va->http_request_->get(cached_ww.url);
@@ -1637,13 +1790,23 @@ void VoiceAssistant::model_load_task(void *params) {
       // A set_configuration while the download was in flight may have withdrawn the activation request.
       const bool still_wanted = this_va->is_wake_word_pending_(id);
 
-      auto model = make_unique<micro_wake_word::WakeWordModel>(id, model_data, quantized_cutoff, window, wake_word_copy,
-                                                               trained_languages, arena);
+      const size_t slot = this_va->find_runtime_slot_(id);
+      if (slot >= RUNTIME_WAKE_WORD_SLOTS) {
+        // The slot was released while the download was in flight, so there is nowhere to record the model's
+        // enabled state. Discard rather than loading a model whose state cannot survive a reboot.
+        ESP_LOGW(TAG, "Discarding downloaded model %s: its slot was released", id.c_str());
+        this_va->erase_pending_wake_word_(id);
+        return;
+      }
+
+      auto model = make_unique<micro_wake_word::WakeWordModel>(
+          id, model_data, quantized_cutoff, window, wake_word_copy, trained_languages, arena,
+          micro_wake_word::WakeWordModel::enabled_preference_key(VoiceAssistant::runtime_slot_id_(slot)));
       auto *raw = model.get();
       if (!this_va->micro_wake_word_->add_runtime_model(std::move(model))) {
-        // The id was free a moment ago and this is the main loop, so a duplicate is no longer possible:
-        // this is a genuine failure (e.g. the pause handshake timed out). Don't retry it on every boot.
-        this_va->mark_model_load_failed_(id);
+        // The id was free a moment ago and this is the main loop, so a duplicate is no longer possible. What
+        // is left is the inference task missing its 500 ms pause handshake.
+        this_va->abandon_runtime_model_(id);
         return;
       }
       if (still_wanted) {

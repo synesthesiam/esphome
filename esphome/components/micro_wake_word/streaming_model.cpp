@@ -284,7 +284,7 @@ WakeWordModel::WakeWordModel(const std::string &id, const uint8_t *model_start, 
 WakeWordModel::WakeWordModel(const std::string &id, std::shared_ptr<ModelData> model_data,
                              uint8_t default_probability_cutoff, size_t sliding_window_average_size,
                              const std::string &wake_word, std::vector<std::string> trained_languages,
-                             size_t tensor_arena_size) {
+                             size_t tensor_arena_size, uint32_t preference_key) {
   this->id_ = id;
   this->model_data_ = std::move(model_data);
   // Callers are expected to pass a validated buffer, so this is normally the stable model pointer. Tolerate a
@@ -305,7 +305,8 @@ WakeWordModel::WakeWordModel(const std::string &id, std::shared_ptr<ModelData> m
   this->current_stride_step_ = 0;
   this->internal_only_ = false;  // Runtime models are always exposed to Home Assistant
 
-  this->pref_ = global_preferences->make_preference<bool>(WakeWordModel::enabled_preference_key(id));
+  // Keyed by the caller's slot, not by id: see the constructor documentation.
+  this->pref_ = global_preferences->make_preference<bool>(preference_key);
   bool enabled;
   if (this->pref_.load(&enabled)) {
     // Use the enabled state loaded from flash

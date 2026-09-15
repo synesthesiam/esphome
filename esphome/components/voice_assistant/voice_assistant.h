@@ -7,6 +7,7 @@
 #include "esphome/core/automation.h"
 #include "esphome/core/component.h"
 #include "esphome/core/helpers.h"
+#include "esphome/core/preferences.h"
 
 #include "esphome/components/api/api_connection.h"
 #include "esphome/components/audio/audio_transfer_buffer.h"
@@ -401,8 +402,48 @@ class VoiceAssistant final : public Component {
   CachedExternalWakeWord *find_cached_wake_word_(const std::string &id);
   bool is_wake_word_pending_(const std::string &id) const;
   void erase_pending_wake_word_(const std::string &id);
-  // Persists a model as disabled (so it isn't retried every boot) and drops it from the optimistic list.
-  void mark_model_load_failed_(const std::string &id);
+
+  /* Runtime wake words occupy a fixed set of slots. Home Assistant shows exactly two wake word select
+     entities, so no more than two can ever be chosen, and reserving a slot per choice keeps the persisted
+     key space fixed at compile time. Keying the enabled flag off the wake word id instead would leave one
+     preference behind for every id Home Assistant has ever advertised, with nothing able to reclaim them.
+     The slot holds the id it was given; the enabled flag lives under the slot's own synthetic id and is
+     written by WakeWordModel::enable()/disable() like any other model's. */
+  static constexpr size_t RUNTIME_WAKE_WORD_SLOTS = 2;
+  // Longest wake word id a slot can hold, including the terminator. Home Assistant builds the id from a
+  // filename stem, so it is not otherwise bounded; longer ids are rejected when the cache is built.
+  static constexpr size_t MAX_WAKE_WORD_ID_LENGTH = 64;
+  // Persisted as one fixed-size record. An empty string means the slot is free.
+  struct RuntimeWakeWordSlots {
+    char ids[RUNTIME_WAKE_WORD_SLOTS][MAX_WAKE_WORD_ID_LENGTH];
+  };
+
+  // Synthetic id naming a slot. Only ever hashed into a preference key, never shown to Home Assistant.
+  static const char *runtime_slot_id_(size_t slot);
+
+  RuntimeWakeWordSlots runtime_wake_word_slots_{};
+  ESPPreferenceObject runtime_wake_word_slots_pref_;
+  // One long-lived preference per slot for its enabled flag. Held rather than made on demand because
+  // ESPPreferenceObject never releases the backend it allocates, so making one per call would leak.
+  ESPPreferenceObject runtime_slot_enabled_prefs_[RUNTIME_WAKE_WORD_SLOTS];
+
+  // Reads the slot record. Called once from setup(), before any request can consult it.
+  void load_runtime_slots_();
+  void save_runtime_slots_();
+  // Slot holding this wake word, or RUNTIME_WAKE_WORD_SLOTS if no slot does.
+  size_t find_runtime_slot_(const std::string &id) const;
+  // Slot for this wake word: its own if it has one, else a free slot, else one whose wake word Home Assistant
+  // no longer advertises. Returns RUNTIME_WAKE_WORD_SLOTS when all slots are in use.
+  size_t claim_runtime_slot_(const std::string &id);
+  void clear_runtime_slot_(size_t slot);
+  // Writes the slot's enabled flag, the same one WakeWordModel::enable()/disable() keeps for a loaded model.
+  void set_runtime_slot_enabled_(size_t slot, bool enabled);
+  // Gives up on a model that could not be loaded: releases its slot, persists the slot as off so Home
+  // Assistant's select shows the wake word is not running, and falls back.
+  void abandon_runtime_model_(const std::string &id);
+  // Turns on the first compiled-in wake word if nothing is listening any more. A device with no compiled-in
+  // models simply runs no wake word until one is chosen that loads, which is a valid configuration.
+  void enable_fallback_model_();
 
   // Starts the background download task if work is queued and no task is already running.
   void try_start_model_load_task_();

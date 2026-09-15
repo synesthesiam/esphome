@@ -128,9 +128,13 @@ class WakeWordModel final : public StreamingModel {
   /// @param wake_word (std::string) Friendly name of the wake word
   /// @param trained_languages (std::vector<std::string>) Languages the model was trained on
   /// @param tensor_arena_size (size_t) Size in bytes for allocating the tensor arena
+  /// @param preference_key (uint32_t) key the enabled state is stored under. Taken from the caller rather than
+  ///                       derived from id, so a caller that reuses a fixed set of slots for the wake words it
+  ///                       downloads leaves a fixed set of preferences behind instead of one per id it has
+  ///                       ever seen. Use enabled_preference_key() to derive it from whatever names the slot.
   WakeWordModel(const std::string &id, std::shared_ptr<ModelData> model_data, uint8_t default_probability_cutoff,
                 size_t sliding_window_average_size, const std::string &wake_word,
-                std::vector<std::string> trained_languages, size_t tensor_arena_size);
+                std::vector<std::string> trained_languages, size_t tensor_arena_size, uint32_t preference_key);
 
   // model_data_ is a member of this class, so it is destroyed before ~StreamingModel() runs. Unload here, while
   // the buffer is still alive, so the interpreter is never torn down over freed model data.
