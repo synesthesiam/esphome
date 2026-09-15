@@ -11,6 +11,7 @@
 #include "esphome/core/automation.h"
 #include "esphome/core/component.h"
 #include "esphome/core/defines.h"
+#include "esphome/core/helpers.h"
 #include "esphome/core/static_task.h"
 
 #ifdef USE_OTA_STATE_LISTENER
@@ -64,6 +65,13 @@ class MicroWakeWord final : public Component
 
   Trigger<std::string> *get_wake_word_detected_trigger() { return &this->wake_word_detected_trigger_; }
 
+  /// @brief Registers a callback run from the main loop when a wake word is detected, just before the
+  /// on_wake_word_detected automation. The voice assistant component uses this to mark the boundary in
+  /// its audio buffer, which an automation running later cannot do as precisely.
+  template<typename F> void add_on_wake_word_detected_callback(F &&callback) {
+    this->wake_word_detected_callback_.add(std::forward<F>(callback));
+  }
+
   void add_wake_word_model(WakeWordModel *model);
 
   /// @brief Adds a runtime-downloaded wake word model. Must be called from the main loop.
@@ -107,6 +115,7 @@ class MicroWakeWord final : public Component
  protected:
   microphone::MicrophoneSource *microphone_source_{nullptr};
   Trigger<std::string> wake_word_detected_trigger_;
+  LazyCallbackManager<void(const std::string &)> wake_word_detected_callback_;
   State state_{State::STOPPED};
 
   std::weak_ptr<ring_buffer::RingBuffer> ring_buffer_;

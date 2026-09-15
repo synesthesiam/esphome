@@ -1,0 +1,39 @@
+substitutions:
+  i2s_din_pin: GPIO34
+  i2s_din_pin2: GPIO35
+  i2s_dout_pin: GPIO32
+
+packages:
+  i2s_audio: !include ../../test_build_components/common/i2s_audio/esp32-idf.yaml
+
+wifi:
+  ssid: MySSID
+  password: password1
+
+api:
+
+# Buffering wake word audio costs RAM for as long as the device runs, so a device short on memory
+# turns it off. Everything else about on-device detection keeps working.
+micro_wake_word:
+  id: mww_id
+  microphone: va_mic_id_external
+  on_wake_word_detected:
+    - voice_assistant.start:
+        wake_word: !lambda return wake_word;
+  models:
+    - model: okay_nabu
+
+microphone:
+  - platform: i2s_audio
+    id: va_mic_id_external
+    i2s_audio_id: i2s_audio_bus
+    i2s_din_pin: ${i2s_din_pin}
+    adc_type: external
+    pdm: false
+
+voice_assistant:
+  microphone:
+    microphone: va_mic_id_external
+    channels: 0
+  micro_wake_word: mww_id
+  preroll_duration: 0s

@@ -47,6 +47,15 @@ CONF_VOLUME_MULTIPLIER = "volume_multiplier"
 
 CONF_MICRO_WAKE_WORD = "micro_wake_word"
 CONF_WAKE_WORD = "wake_word"
+CONF_ON_WAKE_WORD_CONFIRMED = "on_wake_word_confirmed"
+CONF_PREROLL_DURATION = "preroll_duration"
+
+# Buffering a second and a half covers a typical wake word, the moment before it, and the lag of
+# microWakeWord's sliding window. At 16 kHz mono this costs 48 kB of RAM per microphone channel,
+# held for as long as the device is running, on top of the usual streaming buffers.
+DEFAULT_PREROLL_DURATION = "1.5s"
+MIN_PREROLL_DURATION_MS = 250
+MAX_PREROLL_DURATION_MS = 5000
 
 CONF_CONVERSATION_TIMEOUT = "conversation_timeout"
 
@@ -71,6 +80,9 @@ StartContinuousAction = voice_assistant_ns.class_(
 StopAction = voice_assistant_ns.class_(
     "StopAction", automation.Action, cg.Parented.template(VoiceAssistant)
 )
+WakeSoundFinishedAction = voice_assistant_ns.class_(
+    "WakeSoundFinishedAction", automation.Action, cg.Parented.template(VoiceAssistant)
+)
 IsRunningCondition = voice_assistant_ns.class_(
     "IsRunningCondition", automation.Condition, cg.Parented.template(VoiceAssistant)
 )
@@ -79,6 +91,45 @@ ConnectedCondition = voice_assistant_ns.class_(
 )
 
 Timer = voice_assistant_ns.struct("Timer")
+
+
+def validate_preroll_duration(value: cv.TimePeriod) -> cv.TimePeriod:
+    """Zero disables buffering; anything shorter than a wake word is not worth the RAM it costs."""
+    if value == cv.TimePeriod(milliseconds=0):
+        return value
+    return cv.Range(
+        min=cv.TimePeriod(milliseconds=MIN_PREROLL_DURATION_MS),
+        max=cv.TimePeriod(milliseconds=MAX_PREROLL_DURATION_MS),
+    )(value)
+
+
+def preroll_validate(config: ConfigType) -> ConfigType:
+    """Buffering wake word audio only makes sense with on-device detection to buffer ahead of, so it
+    defaults on only when microWakeWord is configured. It costs RAM for as long as the device runs,
+    so a device short on memory can turn it off with 'preroll_duration: 0s'."""
+    has_mww = CONF_MICRO_WAKE_WORD in config
+    if (preroll_duration := config.get(CONF_PREROLL_DURATION)) is None:
+        preroll_duration = (
+            cv.positive_time_period_milliseconds(DEFAULT_PREROLL_DURATION)
+            if has_mww
+            else cv.TimePeriod(milliseconds=0)
+        )
+        config[CONF_PREROLL_DURATION] = preroll_duration
+
+    if preroll_duration > cv.TimePeriod(milliseconds=0):
+        if not has_mww:
+            raise cv.Invalid(
+                f"'{CONF_PREROLL_DURATION}' requires '{CONF_MICRO_WAKE_WORD}', which detects the wake "
+                f"word this buffers the audio for. Set '{CONF_PREROLL_DURATION}: 0s' to disable buffering.",
+                path=[CONF_PREROLL_DURATION],
+            )
+    elif CONF_ON_WAKE_WORD_CONFIRMED in config:
+        raise cv.Invalid(
+            f"'{CONF_ON_WAKE_WORD_CONFIRMED}' only fires when wake word audio is buffered, "
+            f"so it requires a non-zero '{CONF_PREROLL_DURATION}'",
+            path=[CONF_ON_WAKE_WORD_CONFIRMED],
+        )
+    return config
 
 
 def tts_stream_validate(config: ConfigType) -> ConfigType:
@@ -116,6 +167,9 @@ CONFIG_SCHEMA = cv.All(
             cv.Exclusive(CONF_SPEAKER, "output"): cv.use_id(speaker.Speaker),
             cv.Optional(CONF_USE_WAKE_WORD, default=False): cv.boolean,
             cv.Optional(CONF_MICRO_WAKE_WORD): cv.use_id(micro_wake_word.MicroWakeWord),
+            cv.Optional(CONF_PREROLL_DURATION): cv.All(
+                cv.positive_time_period_milliseconds, validate_preroll_duration
+            ),
             cv.Optional(CONF_VAD_THRESHOLD): cv.invalid(
                 "VAD threshold is no longer supported, as it requires the deprecated esp_adf external component. Use an i2s_audio microphone/speaker instead. Additionally, you may need to configure the audio_adc and audio_dac components depending on your hardware."
             ),
@@ -133,6 +187,9 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_ON_LISTENING): automation.validate_automation(single=True),
             cv.Optional(CONF_ON_START): automation.validate_automation(single=True),
             cv.Optional(CONF_ON_WAKE_WORD_DETECTED): automation.validate_automation(
+                single=True
+            ),
+            cv.Optional(CONF_ON_WAKE_WORD_CONFIRMED): automation.validate_automation(
                 single=True
             ),
             cv.Optional(CONF_ON_STT_END): automation.validate_automation(single=True),
@@ -186,6 +243,7 @@ CONFIG_SCHEMA = cv.All(
         }
     ).extend(cv.COMPONENT_SCHEMA),
     tts_stream_validate,
+    preroll_validate,
 )
 
 FINAL_VALIDATE_SCHEMA = cv.All(
@@ -217,6 +275,11 @@ async def to_code(config: ConfigType) -> None:
     if CONF_MICRO_WAKE_WORD in config:
         mww = await cg.get_variable(config[CONF_MICRO_WAKE_WORD])
         cg.add(var.set_micro_wake_word(mww))
+
+    preroll_duration = config[CONF_PREROLL_DURATION]
+    if preroll_duration > cv.TimePeriod(milliseconds=0):
+        cg.add_define("USE_VOICE_ASSISTANT_WAKE_WORD_PREROLL")
+        cg.add(var.set_preroll_duration(preroll_duration.total_milliseconds))
 
     if CONF_MEDIA_PLAYER in config:
         mp = await cg.get_variable(config[CONF_MEDIA_PLAYER])
@@ -251,6 +314,13 @@ async def to_code(config: ConfigType) -> None:
             var.get_wake_word_detected_trigger(),
             [],
             config[CONF_ON_WAKE_WORD_DETECTED],
+        )
+
+    if CONF_ON_WAKE_WORD_CONFIRMED in config:
+        await automation.build_automation(
+            var.get_wake_word_confirmed_trigger(),
+            [],
+            config[CONF_ON_WAKE_WORD_CONFIRMED],
         )
 
     if CONF_ON_STT_END in config:
@@ -443,6 +513,23 @@ async def voice_assistant_listen_to_code(
     "voice_assistant.stop", StopAction, VOICE_ASSISTANT_ACTION_SCHEMA, synchronous=True
 )
 async def voice_assistant_stop_to_code(
+    config: ConfigType,
+    action_id: ID,
+    template_arg: cg.TemplateArguments,
+    args: TemplateArgsType,
+) -> MockObj:
+    var = cg.new_Pvariable(action_id, template_arg)
+    await cg.register_parented(var, config[CONF_ID])
+    return var
+
+
+@register_action(
+    "voice_assistant.wake_sound_finished",
+    WakeSoundFinishedAction,
+    VOICE_ASSISTANT_ACTION_SCHEMA,
+    synchronous=True,
+)
+async def voice_assistant_wake_sound_finished_to_code(
     config: ConfigType,
     action_id: ID,
     template_arg: cg.TemplateArguments,

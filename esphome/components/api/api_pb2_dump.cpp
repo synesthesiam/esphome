@@ -656,6 +656,8 @@ template<> const char *proto_enum_to_string<enums::VoiceAssistantRequestFlag>(en
       return ESPHOME_PSTR("VOICE_ASSISTANT_REQUEST_USE_VAD");
     case enums::VOICE_ASSISTANT_REQUEST_USE_WAKE_WORD:
       return ESPHOME_PSTR("VOICE_ASSISTANT_REQUEST_USE_WAKE_WORD");
+    case enums::VOICE_ASSISTANT_REQUEST_WAKE_WORD_PREROLL:
+      return ESPHOME_PSTR("VOICE_ASSISTANT_REQUEST_WAKE_WORD_PREROLL");
     default:
       return ESPHOME_PSTR("UNKNOWN");
   }
@@ -699,6 +701,20 @@ template<> const char *proto_enum_to_string<enums::VoiceAssistantEvent>(enums::V
       return ESPHOME_PSTR("UNKNOWN");
   }
 }
+#endif
+template<> const char *proto_enum_to_string<enums::VoiceAssistantAudioFlag>(enums::VoiceAssistantAudioFlag value) {
+  switch (value) {
+    case enums::VOICE_ASSISTANT_AUDIO_NONE:
+      return ESPHOME_PSTR("VOICE_ASSISTANT_AUDIO_NONE");
+    case enums::VOICE_ASSISTANT_AUDIO_PREROLL:
+      return ESPHOME_PSTR("VOICE_ASSISTANT_AUDIO_PREROLL");
+    case enums::VOICE_ASSISTANT_AUDIO_DISCARD:
+      return ESPHOME_PSTR("VOICE_ASSISTANT_AUDIO_DISCARD");
+    default:
+      return ESPHOME_PSTR("UNKNOWN");
+  }
+}
+#ifdef USE_VOICE_ASSISTANT
 template<> const char *proto_enum_to_string<enums::VoiceAssistantTimerEvent>(enums::VoiceAssistantTimerEvent value) {
   switch (value) {
     case enums::VOICE_ASSISTANT_TIMER_STARTED:
@@ -2244,6 +2260,7 @@ const char *VoiceAssistantRequest::dump_to(DumpBuffer &out) const {
   this->audio_settings.dump_to(out);
   out.append("\n");
   dump_field(out, ESPHOME_PSTR("wake_word_phrase"), this->wake_word_phrase);
+  dump_field(out, ESPHOME_PSTR("preroll_ms"), this->preroll_ms);
   return out.c_str();
 }
 const char *VoiceAssistantResponse::dump_to(DumpBuffer &out) const {
@@ -2273,6 +2290,7 @@ const char *VoiceAssistantAudio::dump_to(DumpBuffer &out) const {
   dump_bytes_field(out, ESPHOME_PSTR("data"), this->data, this->data_len);
   dump_field(out, ESPHOME_PSTR("end"), this->end);
   dump_bytes_field(out, ESPHOME_PSTR("data2"), this->data2, this->data2_len);
+  dump_field(out, ESPHOME_PSTR("flags"), this->flags);
   return out.c_str();
 }
 const char *VoiceAssistantTimerEventResponse::dump_to(DumpBuffer &out) const {
@@ -2340,6 +2358,7 @@ const char *VoiceAssistantConfigurationResponse::dump_to(DumpBuffer &out) const 
     dump_field(out, ESPHOME_PSTR("active_wake_words"), it, 4);
   }
   dump_field(out, ESPHOME_PSTR("max_active_wake_words"), this->max_active_wake_words);
+  dump_field(out, ESPHOME_PSTR("max_preroll_ms"), this->max_preroll_ms);
   return out.c_str();
 }
 const char *VoiceAssistantSetConfiguration::dump_to(DumpBuffer &out) const {

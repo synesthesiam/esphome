@@ -2937,6 +2937,7 @@ uint8_t *VoiceAssistantRequest::encode(ProtoWriteBuffer &buffer PROTO_ENCODE_DEB
   ProtoEncode::encode_uint32(pos PROTO_ENCODE_DEBUG_ARG, 3, this->flags);
   ProtoEncode::encode_optional_sub_message(pos PROTO_ENCODE_DEBUG_ARG, buffer, 4, this->audio_settings);
   ProtoEncode::encode_string(pos PROTO_ENCODE_DEBUG_ARG, 5, this->wake_word_phrase);
+  ProtoEncode::encode_uint32(pos PROTO_ENCODE_DEBUG_ARG, 6, this->preroll_ms);
   return pos;
 }
 uint32_t VoiceAssistantRequest::calculate_size() const {
@@ -2946,6 +2947,7 @@ uint32_t VoiceAssistantRequest::calculate_size() const {
   size += ProtoSize::calc_uint32(1, this->flags);
   size += ProtoSize::calc_message(1, this->audio_settings.calculate_size());
   size += ProtoSize::calc_length(1, this->wake_word_phrase.size());
+  size += ProtoSize::calc_uint32(1, this->preroll_ms);
   return size;
 }
 bool VoiceAssistantResponse::decode_varint(uint32_t field_id, proto_varint_value_t value) {
@@ -3002,6 +3004,9 @@ bool VoiceAssistantAudio::decode_varint(uint32_t field_id, proto_varint_value_t 
     case 2:
       this->end = value != 0;
       break;
+    case 4:
+      this->flags = value;
+      break;
     default:
       return false;
   }
@@ -3029,6 +3034,7 @@ uint8_t *VoiceAssistantAudio::encode(ProtoWriteBuffer &buffer PROTO_ENCODE_DEBUG
   ProtoEncode::encode_bytes(pos PROTO_ENCODE_DEBUG_ARG, 1, this->data, this->data_len);
   ProtoEncode::encode_bool(pos PROTO_ENCODE_DEBUG_ARG, 2, this->end);
   ProtoEncode::encode_bytes(pos PROTO_ENCODE_DEBUG_ARG, 3, this->data2, this->data2_len);
+  ProtoEncode::encode_uint32(pos PROTO_ENCODE_DEBUG_ARG, 4, this->flags);
   return pos;
 }
 uint32_t VoiceAssistantAudio::calculate_size() const {
@@ -3036,6 +3042,7 @@ uint32_t VoiceAssistantAudio::calculate_size() const {
   size += ProtoSize::calc_length(1, this->data_len);
   size += ProtoSize::calc_bool(1, this->end);
   size += ProtoSize::calc_length(1, this->data2_len);
+  size += ProtoSize::calc_uint32(1, this->flags);
   return size;
 }
 bool VoiceAssistantTimerEventResponse::decode_varint(uint32_t field_id, proto_varint_value_t value) {
@@ -3191,6 +3198,7 @@ uint8_t *VoiceAssistantConfigurationResponse::encode(ProtoWriteBuffer &buffer PR
     ProtoEncode::encode_string(pos PROTO_ENCODE_DEBUG_ARG, 2, it, true);
   }
   ProtoEncode::encode_uint32(pos PROTO_ENCODE_DEBUG_ARG, 3, this->max_active_wake_words);
+  ProtoEncode::encode_uint32(pos PROTO_ENCODE_DEBUG_ARG, 4, this->max_preroll_ms);
   return pos;
 }
 uint32_t VoiceAssistantConfigurationResponse::calculate_size() const {
@@ -3206,6 +3214,7 @@ uint32_t VoiceAssistantConfigurationResponse::calculate_size() const {
     }
   }
   size += ProtoSize::calc_uint32(1, this->max_active_wake_words);
+  size += ProtoSize::calc_uint32(1, this->max_preroll_ms);
   return size;
 }
 bool VoiceAssistantSetConfiguration::decode_length(uint32_t field_id, ProtoLengthDelimited value) {

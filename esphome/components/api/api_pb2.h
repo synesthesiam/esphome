@@ -262,6 +262,7 @@ enum VoiceAssistantRequestFlag : uint32_t {
   VOICE_ASSISTANT_REQUEST_NONE = 0,
   VOICE_ASSISTANT_REQUEST_USE_VAD = 1,
   VOICE_ASSISTANT_REQUEST_USE_WAKE_WORD = 2,
+  VOICE_ASSISTANT_REQUEST_WAKE_WORD_PREROLL = 4,
 };
 #ifdef USE_VOICE_ASSISTANT
 enum VoiceAssistantEvent : uint32_t {
@@ -282,6 +283,13 @@ enum VoiceAssistantEvent : uint32_t {
   VOICE_ASSISTANT_TTS_STREAM_END = 99,
   VOICE_ASSISTANT_INTENT_PROGRESS = 100,
 };
+#endif
+enum VoiceAssistantAudioFlag : uint32_t {
+  VOICE_ASSISTANT_AUDIO_NONE = 0,
+  VOICE_ASSISTANT_AUDIO_PREROLL = 1,
+  VOICE_ASSISTANT_AUDIO_DISCARD = 2,
+};
+#ifdef USE_VOICE_ASSISTANT
 enum VoiceAssistantTimerEvent : uint32_t {
   VOICE_ASSISTANT_TIMER_STARTED = 0,
   VOICE_ASSISTANT_TIMER_UPDATED = 1,
@@ -2479,7 +2487,7 @@ class VoiceAssistantAudioSettings final : public ProtoMessage {
 class VoiceAssistantRequest final : public ProtoMessage {
  public:
   static constexpr uint16_t MESSAGE_TYPE = 90;
-  static constexpr uint8_t ESTIMATED_SIZE = 41;
+  static constexpr uint8_t ESTIMATED_SIZE = 45;
 #ifdef HAS_PROTO_MESSAGE_DUMP
   const LogString *message_name() const override { return LOG_STR("voice_assistant_request"); }
 #endif
@@ -2488,6 +2496,7 @@ class VoiceAssistantRequest final : public ProtoMessage {
   uint32_t flags{0};
   VoiceAssistantAudioSettings audio_settings{};
   StringRef wake_word_phrase{};
+  uint32_t preroll_ms{0};
   uint8_t *encode(ProtoWriteBuffer &buffer PROTO_ENCODE_DEBUG_PARAM) const;
   uint32_t calculate_size() const;
 #ifdef HAS_PROTO_MESSAGE_DUMP
@@ -2543,7 +2552,7 @@ class VoiceAssistantEventResponse final : public ProtoDecodableMessage {
 class VoiceAssistantAudio final : public ProtoDecodableMessage {
  public:
   static constexpr uint16_t MESSAGE_TYPE = 106;
-  static constexpr uint8_t ESTIMATED_SIZE = 40;
+  static constexpr uint8_t ESTIMATED_SIZE = 44;
 #ifdef HAS_PROTO_MESSAGE_DUMP
   const LogString *message_name() const override { return LOG_STR("voice_assistant_audio"); }
 #endif
@@ -2552,6 +2561,7 @@ class VoiceAssistantAudio final : public ProtoDecodableMessage {
   bool end{false};
   const uint8_t *data2{nullptr};
   uint16_t data2_len{0};
+  uint32_t flags{0};
   uint8_t *encode(ProtoWriteBuffer &buffer PROTO_ENCODE_DEBUG_PARAM) const;
   uint32_t calculate_size() const;
 #ifdef HAS_PROTO_MESSAGE_DUMP
@@ -2666,13 +2676,14 @@ class VoiceAssistantConfigurationRequest final : public ProtoDecodableMessage {
 class VoiceAssistantConfigurationResponse final : public ProtoMessage {
  public:
   static constexpr uint16_t MESSAGE_TYPE = 122;
-  static constexpr uint8_t ESTIMATED_SIZE = 56;
+  static constexpr uint8_t ESTIMATED_SIZE = 60;
 #ifdef HAS_PROTO_MESSAGE_DUMP
   const LogString *message_name() const override { return LOG_STR("voice_assistant_configuration_response"); }
 #endif
   std::vector<VoiceAssistantWakeWord> available_wake_words{};
   const std::vector<std::string> *active_wake_words{};
   uint32_t max_active_wake_words{0};
+  uint32_t max_preroll_ms{0};
   uint8_t *encode(ProtoWriteBuffer &buffer PROTO_ENCODE_DEBUG_PARAM) const;
   uint32_t calculate_size() const;
 #ifdef HAS_PROTO_MESSAGE_DUMP

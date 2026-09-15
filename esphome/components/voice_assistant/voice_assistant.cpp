@@ -32,6 +32,20 @@ static const size_t SPEAKER_BUFFER_SIZE = 16 * RECEIVE_SIZE;
 // SEND_BUFFER_SAMPLES (32 ms), so this is far longer than any legitimate gap between chunks.
 static const uint32_t AUDIO_CHANNEL_STALL_TIMEOUT_MS = 2000;
 
+#ifdef USE_VOICE_ASSISTANT_WAKE_WORD_PREROLL
+// How long a buffered detection stays usable if no pipeline run picks it up. The automation that decides
+// whether to start a run executes in the same loop() pass as the detection, so this only needs to cover a
+// configuration that defers the decision.
+static const uint32_t PREROLL_PENDING_TIMEOUT_MS = 1000;
+// How long a run that sent preroll waits for Home Assistant to confirm or reject the wake word before
+// giving up. Without this the device would stream indefinitely with no user feedback if Home Assistant
+// stopped answering.
+static const uint32_t PREROLL_CONFIRM_TIMEOUT_MS = 3000;
+// Upper bound on how long audio is marked as contaminated by the wake sound, in case the automation never
+// runs the wake_sound_finished action.
+static const uint32_t WAKE_SOUND_MAX_MS = 2000;
+#endif
+
 VoiceAssistant::VoiceAssistant() { global_voice_assistant = this; }
 
 void VoiceAssistant::setup() {
@@ -51,6 +65,26 @@ void VoiceAssistant::setup() {
       }
     });
   }
+
+#ifdef USE_VOICE_ASSISTANT_WAKE_WORD_PREROLL
+  if ((this->preroll_duration_ms_ > 0) && (this->micro_wake_word_ != nullptr)) {
+    this->preroll_capacity_ = (this->preroll_duration_ms_ * SAMPLE_RATE_HZ / 1000) * sizeof(int16_t);
+    // The buffers must exist for the whole life of the component: audio has to be captured before the wake
+    // word is spoken, so there is no later point at which they could be allocated. If the device cannot
+    // spare the RAM, fall back to the plain per-run buffers and do not advertise the feature.
+    if (this->allocate_buffers_()) {
+      this->preroll_buffers_ready_ = true;
+      this->micro_wake_word_->add_on_wake_word_detected_callback(
+          [this](const std::string &wake_word) { this->on_wake_word_detected_(wake_word); });
+    } else {
+      ESP_LOGW(TAG, "Not enough memory for %" PRIu32 " ms of wake word audio; preroll disabled",
+               this->preroll_duration_ms_);
+      this->preroll_capacity_ = 0;
+      this->preroll_duration_ms_ = 0;
+      this->deallocate_buffers_();
+    }
+  }
+#endif
 
 #ifdef USE_MEDIA_PLAYER
   if (this->media_player_ != nullptr) {
@@ -131,8 +165,17 @@ bool VoiceAssistant::allocate_buffers_() {
   }
 #endif
 
+  // When buffering wake word audio, the ring buffers hold the preroll window on top of the usual streaming
+  // allowance. The extra allowance is the headroom the buffered audio has to survive the round trip to Home
+  // Assistant: it is discarded at detection, so writes have somewhere to go before the oldest samples of the
+  // preroll itself start being overwritten.
+  size_t ring_buffer_size = RING_BUFFER_SIZE;
+#ifdef USE_VOICE_ASSISTANT_WAKE_WORD_PREROLL
+  ring_buffer_size += this->preroll_capacity_;
+#endif
+
   if (this->audio_source_ == nullptr) {
-    std::shared_ptr<ring_buffer::RingBuffer> temp_ring_buffer = ring_buffer::RingBuffer::create(RING_BUFFER_SIZE);
+    std::shared_ptr<ring_buffer::RingBuffer> temp_ring_buffer = ring_buffer::RingBuffer::create(ring_buffer_size);
     if (temp_ring_buffer == nullptr) {
       ESP_LOGE(TAG, "Could not allocate ring buffer");
       return false;
@@ -148,7 +191,7 @@ bool VoiceAssistant::allocate_buffers_() {
 
   // Second microphone channel
   if ((this->mic_source2_ != nullptr) && (this->audio_source2_ == nullptr)) {
-    std::shared_ptr<ring_buffer::RingBuffer> temp_ring_buffer = ring_buffer::RingBuffer::create(RING_BUFFER_SIZE);
+    std::shared_ptr<ring_buffer::RingBuffer> temp_ring_buffer = ring_buffer::RingBuffer::create(ring_buffer_size);
     if (temp_ring_buffer == nullptr) {
       ESP_LOGE(TAG, "Could not allocate second ring buffer");
       return false;
@@ -189,11 +232,18 @@ void VoiceAssistant::clear_buffers_() {
 }
 
 void VoiceAssistant::deallocate_buffers_() {
-  // Destroying each source releases its ring buffer; the matching weak_ptr then expires automatically.
-  this->audio_source_.reset();
+  // The microphone buffers hold the audio from before the next wake word, so when that is being buffered
+  // they outlive individual runs. Everything else is still released.
+#ifdef USE_VOICE_ASSISTANT_WAKE_WORD_PREROLL
+  if (!this->preroll_buffers_ready_)
+#endif
+  {
+    // Destroying each source releases its ring buffer; the matching weak_ptr then expires automatically.
+    this->audio_source_.reset();
 
-  // Second microphone channel
-  this->audio_source2_.reset();
+    // Second microphone channel
+    this->audio_source2_.reset();
+  }
 
 #ifdef USE_SPEAKER
   if ((this->speaker_ != nullptr) && (this->speaker_buffer_ != nullptr)) {
@@ -208,6 +258,86 @@ void VoiceAssistant::reset_conversation_id() {
   this->conversation_id_ = "";
   ESP_LOGD(TAG, "reset conversation ID");
 }
+
+#ifdef USE_VOICE_ASSISTANT_WAKE_WORD_PREROLL
+bool VoiceAssistant::preroll_should_arm_() const {
+  // Only worth capturing while microWakeWord could produce a detection this component would act on.
+  // Continuous mode already streams everything, so there is nothing to buffer ahead of.
+  return this->preroll_buffers_ready_ && (this->api_client_ != nullptr) && !this->continuous_ &&
+         !this->use_wake_word_ && (this->micro_wake_word_ != nullptr) && this->micro_wake_word_->is_running();
+}
+
+size_t VoiceAssistant::trim_to_preroll_(audio::RingBufferAudioSource *source,
+                                        const std::weak_ptr<ring_buffer::RingBuffer> &ring) {
+  if (source == nullptr) {
+    return 0;
+  }
+  std::shared_ptr<ring_buffer::RingBuffer> temp_ring_buffer = ring.lock();
+  if (temp_ring_buffer == nullptr) {
+    return 0;
+  }
+
+  // Nothing is exposed while idle, so the ring buffer's own backlog is the whole buffered window.
+  size_t buffered = temp_ring_buffer->available();
+  size_t to_discard = (buffered > this->preroll_capacity_) ? (buffered - this->preroll_capacity_) : 0;
+  while (to_discard > 0) {
+    source->fill(0, false);
+    const size_t available = source->available();
+    if (available == 0) {
+      break;
+    }
+    const size_t discarded = std::min(available, to_discard);
+    source->consume(discarded);
+    to_discard -= discarded;
+  }
+
+  return temp_ring_buffer->available() + source->available();
+}
+
+void VoiceAssistant::on_wake_word_detected_(const std::string &wake_word) {
+  if (!this->preroll_armed_ || (this->state_ != State::IDLE)) {
+    // Not capturing for preroll, or a run is already under way; the detection is handled the usual way.
+    return;
+  }
+
+  // Drop everything older than the configured window. What is left is exactly the audio leading up to the
+  // detection, and the space freed is the headroom for the audio that arrives while Home Assistant answers.
+  const size_t buffered = this->trim_to_preroll_(this->audio_source_.get(), this->ring_buffer_);
+  this->trim_to_preroll_(this->audio_source2_.get(), this->ring_buffer2_);
+
+  this->preroll_remaining_ = buffered;
+  this->preroll_pending_ = true;
+  ESP_LOGD(TAG, "Buffered %u ms of audio before '%s'",
+           static_cast<unsigned>(buffered / sizeof(int16_t) * 1000 / SAMPLE_RATE_HZ), wake_word.c_str());
+
+  // The automation deciding whether to start a run executes later in this same loop() pass. If it decides
+  // not to (muted, a timer was ringing, the "stop" word), release the detection so capture resumes.
+  this->set_timeout("preroll-pending", PREROLL_PENDING_TIMEOUT_MS, [this]() {
+    if (this->preroll_pending_) {
+      ESP_LOGV(TAG, "Buffered detection went unused");
+      this->clear_preroll_();
+    }
+  });
+}
+
+void VoiceAssistant::clear_preroll_() {
+  this->cancel_timeout("preroll-pending");
+  this->cancel_timeout("preroll-confirm");
+  this->cancel_timeout("wake-sound");
+  this->preroll_pending_ = false;
+  this->preroll_run_ = false;
+  this->preroll_remaining_ = 0;
+  this->discard_audio_ = false;
+}
+
+void VoiceAssistant::wake_sound_finished() {
+  if (this->discard_audio_) {
+    ESP_LOGD(TAG, "Wake sound finished");
+    this->cancel_timeout("wake-sound");
+    this->discard_audio_ = false;
+  }
+}
+#endif
 
 void VoiceAssistant::stream_api_audio_() {
   // Both microphone channels are sent together, if configured. Home Assistant feeds one of the
@@ -239,13 +369,30 @@ void VoiceAssistant::stream_api_audio_() {
     // Both channels have audio exposed; clear any in-progress stall timer.
     this->audio_channel_stall_start_ = 0;
 
+    size_t send_len = available;
+    size_t send_len2 = available2;
+    uint32_t audio_flags = 0;
+#ifdef USE_VOICE_ASSISTANT_WAKE_WORD_PREROLL
+    if (this->preroll_remaining_ > 0) {
+      // A message is either wholly buffered audio or wholly live audio, so Home Assistant can split the
+      // stream on the flag alone. Both channels are written by the same microphone callback and so carry
+      // the same byte counts; clamping both by one boundary keeps them sample aligned.
+      audio_flags = api::enums::VOICE_ASSISTANT_AUDIO_PREROLL;
+      send_len = std::min(send_len, this->preroll_remaining_);
+      send_len2 = std::min(send_len2, this->preroll_remaining_);
+    } else if (this->discard_audio_) {
+      audio_flags = api::enums::VOICE_ASSISTANT_AUDIO_DISCARD;
+    }
+#endif
+
     api::VoiceAssistantAudio msg;
     // Zero-copy: send_message() copies the data out before we consume it.
     msg.data = this->audio_source_->data();
-    msg.data_len = available;
+    msg.data_len = send_len;
+    msg.flags = audio_flags;
     if (this->audio_source2_ != nullptr) {
       msg.data2 = this->audio_source2_->data();
-      msg.data2_len = available2;
+      msg.data2_len = send_len2;
     }
 
     if (!this->api_client_->send_message(msg)) {
@@ -256,10 +403,18 @@ void VoiceAssistant::stream_api_audio_() {
       return;
     }
 
-    this->audio_source_->consume(available);
+    this->audio_source_->consume(send_len);
     if (this->audio_source2_ != nullptr) {
-      this->audio_source2_->consume(available2);
+      this->audio_source2_->consume(send_len2);
     }
+#ifdef USE_VOICE_ASSISTANT_WAKE_WORD_PREROLL
+    if (this->preroll_remaining_ > 0) {
+      this->preroll_remaining_ -= std::min(send_len, this->preroll_remaining_);
+      if (this->preroll_remaining_ == 0) {
+        ESP_LOGD(TAG, "Buffered audio sent, streaming live audio");
+      }
+    }
+#endif
   }
 }
 
@@ -307,9 +462,36 @@ void VoiceAssistant::loop() {
       if (this->continuous_ && this->desired_state_ == State::IDLE) {
         this->idle_trigger_.trigger();
         this->set_state_(State::START_MICROPHONE, State::START_PIPELINE);
-      } else {
-        this->deallocate_buffers_();
+        break;
       }
+#ifdef USE_VOICE_ASSISTANT_WAKE_WORD_PREROLL
+      // While idle the microphone keeps filling the ring buffers so the audio leading up to a wake word is
+      // already captured when microWakeWord reports one. Nothing drains them: the ring buffers overwrite
+      // their oldest data, so they always hold the most recent audio without any work in the main loop.
+      const bool should_arm = this->preroll_should_arm_();
+      if (should_arm != this->preroll_armed_) {
+        this->preroll_armed_ = should_arm;
+        if (should_arm) {
+          ESP_LOGD(TAG, "Buffering wake word audio");
+          this->clear_buffers_();
+          this->mic_source_->start();
+          if (this->mic_source2_ != nullptr) {
+            this->mic_source2_->start();
+          }
+        } else {
+          ESP_LOGD(TAG, "No longer buffering wake word audio");
+          this->clear_preroll_();
+          this->mic_source_->stop();
+          if (this->mic_source2_ != nullptr) {
+            this->mic_source2_->stop();
+          }
+        }
+      }
+      if (this->preroll_armed_) {
+        break;
+      }
+#endif
+      this->deallocate_buffers_();
       break;
     }
     case State::START_MICROPHONE: {
@@ -321,7 +503,16 @@ void VoiceAssistant::loop() {
       if (this->status_has_error()) {
         this->status_clear_error();
       }
-      this->clear_buffers_();
+#ifdef USE_VOICE_ASSISTANT_WAKE_WORD_PREROLL
+      if (this->preroll_run_) {
+        // This run keeps the audio already captured ahead of the detection, so the buffers are not cleared.
+        // Reset the multi-channel stall watchdog on its own (see audio_channel_stall_start_).
+        this->audio_channel_stall_start_ = 0;
+      } else
+#endif
+      {
+        this->clear_buffers_();
+      }
 
       this->mic_source_->start();
       if (this->mic_source2_) {
@@ -351,9 +542,22 @@ void VoiceAssistant::loop() {
       api::VoiceAssistantRequest msg;
       msg.start = true;
       msg.conversation_id = StringRef(this->conversation_id_);
-      msg.flags = flags;
       msg.audio_settings = audio_settings;
       msg.wake_word_phrase = StringRef(this->wake_word_);
+
+#ifdef USE_VOICE_ASSISTANT_WAKE_WORD_PREROLL
+      if (this->preroll_run_) {
+        // Home Assistant checks the wake word itself before starting speech-to-text, so this run does not
+        // wake the device up yet. It waits for a WAKE_WORD_END event, or a "no_wake_word" error.
+        flags |= api::enums::VOICE_ASSISTANT_REQUEST_WAKE_WORD_PREROLL;
+        msg.preroll_ms = this->preroll_remaining_ / sizeof(int16_t) * 1000 / SAMPLE_RATE_HZ;
+        this->set_timeout("preroll-confirm", PREROLL_CONFIRM_TIMEOUT_MS, [this]() {
+          ESP_LOGW(TAG, "No wake word verdict from Home Assistant, stopping");
+          this->request_stop();
+        });
+      }
+#endif
+      msg.flags = flags;
 
       // Reset media player state tracking
 #ifdef USE_MEDIA_PLAYER
@@ -654,6 +858,15 @@ void VoiceAssistant::start_streaming(struct sockaddr_storage *addr, uint16_t por
   ESP_LOGD(TAG, "Client started, streaming microphone");
   this->audio_mode_ = AUDIO_MODE_UDP;
 
+#ifdef USE_VOICE_ASSISTANT_WAKE_WORD_PREROLL
+  if (this->preroll_run_) {
+    // UDP audio carries no per-chunk markers, so Home Assistant could not tell the buffered audio from the
+    // live audio. Send the buffered audio as ordinary audio and run as a plain on-device detection.
+    ESP_LOGW(TAG, "UDP audio mode does not support wake word audio buffering");
+    this->clear_preroll_();
+  }
+#endif
+
   if (this->mic_source2_ != nullptr) {
     ESP_LOGW(TAG, "UDP audio mode does not support a second microphone channel; only the primary will be streamed");
   }
@@ -691,6 +904,17 @@ void VoiceAssistant::request_start(bool continuous, bool silence_detection) {
     this->continuous_ = continuous;
     this->silence_detection_ = silence_detection;
 
+#ifdef USE_VOICE_ASSISTANT_WAKE_WORD_PREROLL
+    // Claim the audio buffered ahead of the detection that led here, if there is any. Continuous runs are
+    // already streaming everything, so there is nothing to prepend.
+    this->cancel_timeout("preroll-pending");
+    this->preroll_run_ = this->preroll_pending_ && !continuous;
+    this->preroll_pending_ = false;
+    if (!this->preroll_run_) {
+      this->preroll_remaining_ = 0;
+    }
+#endif
+
     this->set_state_(State::START_MICROPHONE, State::START_PIPELINE);
   }
 }
@@ -698,6 +922,9 @@ void VoiceAssistant::request_start(bool continuous, bool silence_detection) {
 void VoiceAssistant::request_stop() {
   this->continuous_ = false;
   this->continue_conversation_ = false;
+#ifdef USE_VOICE_ASSISTANT_WAKE_WORD_PREROLL
+  this->clear_preroll_();
+#endif
 
   switch (this->state_) {
     case State::IDLE:
@@ -788,6 +1015,31 @@ void VoiceAssistant::on_event(const api::VoiceAssistantEventResponse &msg) {
       break;
     case api::enums::VOICE_ASSISTANT_WAKE_WORD_END: {
       ESP_LOGD(TAG, "Wake word detected");
+#ifdef USE_VOICE_ASSISTANT_WAKE_WORD_PREROLL
+      if (this->preroll_run_) {
+        // Home Assistant verified the buffered wake word. It asks for the wake sound only when it detected a
+        // pause after the wake word; if the user carried straight on into a command, staying silent keeps the
+        // sound out of the audio going to speech-to-text.
+        this->cancel_timeout("preroll-confirm");
+        this->preroll_run_ = false;
+        bool play_wake_sound = false;
+        for (const auto &arg : msg.data) {
+          if (arg.name == "play_wake_sound") {
+            play_wake_sound = (arg.value == "1");
+          }
+        }
+        if (play_wake_sound) {
+          // Audio captured from here until the automation reports the sound has finished is contaminated by
+          // it, and is marked so Home Assistant can drop it before speech-to-text.
+          this->discard_audio_ = true;
+          this->set_timeout("wake-sound", WAKE_SOUND_MAX_MS, [this]() {
+            ESP_LOGW(TAG, "Wake sound never reported as finished");
+            this->discard_audio_ = false;
+          });
+          this->defer([this]() { this->wake_word_confirmed_trigger_.trigger(); });
+        }
+      }
+#endif
       this->defer([this]() { this->wake_word_detected_trigger_.trigger(); });
       break;
     }
@@ -935,6 +1187,15 @@ void VoiceAssistant::on_event(const api::VoiceAssistantEventResponse &msg) {
         }
       }
       if (code == "wake-word-timeout" || code == "wake_word_detection_aborted" || code == "no_wake_word") {
+#ifdef USE_VOICE_ASSISTANT_WAKE_WORD_PREROLL
+        if (this->preroll_run_) {
+          // Home Assistant rejected the buffered wake word as a false positive. The device never woke up,
+          // so it just goes quiet and resumes buffering.
+          ESP_LOGD(TAG, "Wake word rejected by Home Assistant");
+          this->request_stop();
+          return;
+        }
+#endif
         // Don't change state here since either the "tts-end" or "run-end" events will do it.
         return;
       } else if (code == "wake-provider-missing" || code == "wake-engine-missing") {
@@ -1119,6 +1380,11 @@ void VoiceAssistant::on_set_configuration(const std::vector<std::string> &active
 const Configuration &VoiceAssistant::get_configuration() {
   this->config_.available_wake_words.clear();
   this->config_.active_wake_words.clear();
+#ifdef USE_VOICE_ASSISTANT_WAKE_WORD_PREROLL
+  this->config_.max_preroll_ms = this->preroll_buffers_ready_ ? this->preroll_duration_ms_ : 0;
+#else
+  this->config_.max_preroll_ms = 0;
+#endif
 
 #ifdef USE_MICRO_WAKE_WORD
   if (this->micro_wake_word_) {

@@ -1359,6 +1359,7 @@ bool APIConnection::send_voice_assistant_get_configuration_response_(
 
   resp.active_wake_words = &config.active_wake_words;
   resp.max_active_wake_words = config.max_active_wake_words;
+  resp.max_preroll_ms = config.max_preroll_ms;
   return this->send_message(resp);
 }
 void APIConnection::on_voice_assistant_configuration_request(const VoiceAssistantConfigurationRequest &msg) {

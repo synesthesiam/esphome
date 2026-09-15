@@ -93,6 +93,7 @@ struct Configuration {
   std::vector<WakeWord> available_wake_words;
   std::vector<std::string> active_wake_words;
   uint32_t max_active_wake_words;
+  uint32_t max_preroll_ms;
 };
 
 #ifdef USE_MEDIA_PLAYER
@@ -218,6 +219,17 @@ class VoiceAssistant final : public Component {
   void client_subscription(api::APIConnection *client, bool subscribe);
   api::APIConnection *get_api_connection() const { return this->api_client_; }
 
+#ifdef USE_VOICE_ASSISTANT_WAKE_WORD_PREROLL
+  void set_preroll_duration(uint32_t preroll_duration_ms) { this->preroll_duration_ms_ = preroll_duration_ms; }
+
+  /// @brief Fires once Home Assistant has confirmed an on-device detection and asked for the wake sound.
+  /// The automation should play the sound and then run the ``voice_assistant.wake_sound_finished`` action.
+  Trigger<> *get_wake_word_confirmed_trigger() { return &this->wake_word_confirmed_trigger_; }
+
+  /// @brief Ends the region of audio marked as contaminated by the wake sound. Safe to call at any time.
+  void wake_sound_finished();
+#endif
+
   void set_wake_word(const std::string &wake_word) { this->wake_word_ = wake_word; }
 
   Trigger<Timer> *get_timer_started_trigger() { return &this->timer_started_trigger_; }
@@ -240,6 +252,18 @@ class VoiceAssistant final : public Component {
 
   // Drains the exposed microphone audio and sends it to Home Assistant over the API in one loop() pass.
   void stream_api_audio_();
+
+#ifdef USE_VOICE_ASSISTANT_WAKE_WORD_PREROLL
+  // True once Home Assistant has asked for preroll and microWakeWord is detecting, so the microphone
+  // should be capturing into the ring buffers even though no pipeline is running.
+  bool preroll_should_arm_() const;
+  // Runs from the main loop on a microWakeWord detection. Discards everything older than the configured
+  // preroll window so the buffers hold only pre-detection audio, and records how much that is.
+  void on_wake_word_detected_(const std::string &wake_word);
+  // Drops ``bytes`` of the oldest buffered audio from a source. Returns the bytes still buffered after.
+  size_t trim_to_preroll_(audio::RingBufferAudioSource *source, const std::weak_ptr<ring_buffer::RingBuffer> &ring);
+  void clear_preroll_();
+#endif
   // Handles a pass where at least one configured channel has no audio exposed, timing out a channel that
   // stalls. See audio_channel_stall_start_.
   void handle_channel_stall_(size_t available, size_t available2);
@@ -345,6 +369,30 @@ class VoiceAssistant final : public Component {
 #ifdef USE_MICRO_WAKE_WORD
   micro_wake_word::MicroWakeWord *micro_wake_word_{nullptr};
 #endif
+
+#ifdef USE_VOICE_ASSISTANT_WAKE_WORD_PREROLL
+  Trigger<> wake_word_confirmed_trigger_;
+
+  // Configured length of the pre-detection audio window. The ring buffers are oversized by the usual
+  // streaming allowance on top of this, which is the headroom the buffered audio has to survive the
+  // round trip to Home Assistant before the oldest samples start being overwritten.
+  uint32_t preroll_duration_ms_{0};
+  // Bytes of the configured window, per channel.
+  size_t preroll_capacity_{0};
+  // Bytes of buffered pre-detection audio still to be sent for the current run.
+  size_t preroll_remaining_{0};
+  // Set once the enlarged buffers are allocated. False if the device could not spare the memory, in
+  // which case it behaves as though buffering were never configured.
+  bool preroll_buffers_ready_{false};
+  // Set while the microphone is capturing purely to keep the preroll window filled.
+  bool preroll_armed_{false};
+  // Set between a microWakeWord detection and the pipeline run that consumes it.
+  bool preroll_pending_{false};
+  // Set for a run that opened with preroll, so it waits for Home Assistant's verdict.
+  bool preroll_run_{false};
+  // Set while the wake sound is playing and the captured audio is contaminated.
+  bool discard_audio_{false};
+#endif
 };
 
 template<typename... Ts> class StartAction final : public Action<Ts...>, public Parented<VoiceAssistant> {
@@ -371,6 +419,13 @@ template<typename... Ts> class StopAction final : public Action<Ts...>, public P
  public:
   void play(const Ts &...x) override { this->parent_->request_stop(); }
 };
+
+#ifdef USE_VOICE_ASSISTANT_WAKE_WORD_PREROLL
+template<typename... Ts> class WakeSoundFinishedAction final : public Action<Ts...>, public Parented<VoiceAssistant> {
+ public:
+  void play(const Ts &...x) override { this->parent_->wake_sound_finished(); }
+};
+#endif
 
 template<typename... Ts> class IsRunningCondition final : public Condition<Ts...>, public Parented<VoiceAssistant> {
  public:

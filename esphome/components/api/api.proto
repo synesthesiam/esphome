@@ -2057,6 +2057,10 @@ enum VoiceAssistantRequestFlag {
   VOICE_ASSISTANT_REQUEST_NONE = 0;
   VOICE_ASSISTANT_REQUEST_USE_VAD = 1;
   VOICE_ASSISTANT_REQUEST_USE_WAKE_WORD = 2;
+  // This run starts with buffered pre-detection audio, which the device is configured to capture.
+  // Home Assistant should verify the wake word itself before starting speech-to-text, and tell the
+  // device the outcome (see VOICE_ASSISTANT_WAKE_WORD_END and the "no_wake_word" error code).
+  VOICE_ASSISTANT_REQUEST_WAKE_WORD_PREROLL = 4;
 }
 
 message VoiceAssistantAudioSettings {
@@ -2075,6 +2079,10 @@ message VoiceAssistantRequest {
   uint32 flags = 3;
   VoiceAssistantAudioSettings audio_settings = 4;
   string wake_word_phrase = 5;
+  // Length of the buffered pre-detection audio that opens this run, in milliseconds. Only set when
+  // VOICE_ASSISTANT_REQUEST_WAKE_WORD_PREROLL is present. The exact boundary is marked on the audio
+  // messages themselves; this is the expected length, so Home Assistant can size its own buffers.
+  uint32 preroll_ms = 6;
 }
 
 message VoiceAssistantResponse {
@@ -2119,6 +2127,16 @@ message VoiceAssistantEventResponse {
   repeated VoiceAssistantEventData data = 2;
 }
 
+enum VoiceAssistantAudioFlag {
+  VOICE_ASSISTANT_AUDIO_NONE = 0;
+  // This chunk is buffered audio from before the on-device wake word detection. The detection point
+  // is where these chunks stop and unflagged chunks begin.
+  VOICE_ASSISTANT_AUDIO_PREROLL = 1;
+  // This chunk was captured while the device played its confirmation sound, so it is contaminated.
+  // Home Assistant should drop everything up to and including the last flagged chunk.
+  VOICE_ASSISTANT_AUDIO_DISCARD = 2;
+}
+
 message VoiceAssistantAudio {
   option (id) = 106;
   option (source) = SOURCE_BOTH;
@@ -2127,6 +2145,7 @@ message VoiceAssistantAudio {
   bytes data = 1 [(pointer_to_buffer) = true];
   bool end = 2;
   bytes data2 = 3 [(pointer_to_buffer) = true];
+  uint32 flags = 4;
 }
 
 enum VoiceAssistantTimerEvent {
@@ -2200,6 +2219,9 @@ message VoiceAssistantConfigurationResponse {
   repeated VoiceAssistantWakeWord available_wake_words = 1;
   repeated string active_wake_words = 2 [(container_pointer) = "std::vector"];
   uint32 max_active_wake_words = 3;
+  // Length of pre-detection audio the device buffers ahead of an on-device wake word detection, in
+  // milliseconds. 0 if it is not configured to buffer any, or could not spare the memory to.
+  uint32 max_preroll_ms = 4;
 }
 
 message VoiceAssistantSetConfiguration {
