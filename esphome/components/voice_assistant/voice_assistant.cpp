@@ -1267,6 +1267,38 @@ bool verify_model_sha256(const uint8_t *data, size_t size, const std::string &ex
   return false;
 }
 
+// Reads a full response body from the model download task. Mirrors http_request::http_read_fully, minus its
+// App.feed_wdt() call: that helper is written for the main loop, and Application rate limits every watchdog
+// feed through one shared timestamp while arch_feed_wdt() only resets the watchdog of the calling task. Feeding
+// it from here would refresh that timestamp on every chunk, suppress the loop task's own reset for the whole
+// download, and panic-reboot the device on a slow transfer. The ESP-IDF container still feeds the watchdog from
+// read() where it is safe to, guarded by esp_task_wdt_status().
+http_request::HttpReadResult http_read_fully_off_loop(http_request::HttpContainer *container, uint8_t *buffer,
+                                                      size_t total_size, size_t chunk_size, uint32_t timeout_ms) {
+  size_t read_index = 0;
+  uint32_t last_data_time = millis();
+
+  while (read_index < total_size) {
+    int read_bytes_or_error = container->read(buffer + read_index, std::min(chunk_size, total_size - read_index));
+
+    yield();
+
+    auto result = http_request::http_read_loop_result(read_bytes_or_error, last_data_time, timeout_ms,
+                                                      container->is_read_complete());
+    if (result == http_request::HttpReadLoopResult::RETRY)
+      continue;
+    if (result == http_request::HttpReadLoopResult::COMPLETE)
+      break;  // Server sent less data than requested, but the transfer is complete
+    if (result == http_request::HttpReadLoopResult::ERROR)
+      return {http_request::HttpReadStatus::ERROR, read_bytes_or_error};
+    if (result == http_request::HttpReadLoopResult::TIMEOUT)
+      return {http_request::HttpReadStatus::TIMEOUT, 0};
+
+    read_index += read_bytes_or_error;
+  }
+  return {http_request::HttpReadStatus::OK, 0};
+}
+
 }  // namespace
 
 void VoiceAssistant::cache_external_wake_words_(const std::vector<api::VoiceAssistantExternalWakeWord> &wake_words) {
@@ -1442,8 +1474,8 @@ void VoiceAssistant::model_load_task(void *params) {
     std::string manifest_str;
     manifest_str.resize(manifest_size);
     auto manifest_read =
-        http_request::http_read_fully(manifest_container.get(), reinterpret_cast<uint8_t *>(manifest_str.data()),
-                                      manifest_size, MODEL_DOWNLOAD_CHUNK_SIZE, this_va->http_request_->get_timeout());
+        http_read_fully_off_loop(manifest_container.get(), reinterpret_cast<uint8_t *>(manifest_str.data()),
+                                 manifest_size, MODEL_DOWNLOAD_CHUNK_SIZE, this_va->http_request_->get_timeout());
     size_t manifest_bytes = manifest_container->get_bytes_read();
     manifest_container->end();
     if (manifest_read.status != http_request::HttpReadStatus::OK || manifest_bytes == 0) {
@@ -1552,8 +1584,8 @@ void VoiceAssistant::model_load_task(void *params) {
       fail();
       continue;
     }
-    auto model_read = http_request::http_read_fully(container.get(), model_data->get_write_pointer(), model_size,
-                                                    MODEL_DOWNLOAD_CHUNK_SIZE, this_va->http_request_->get_timeout());
+    auto model_read = http_read_fully_off_loop(container.get(), model_data->get_write_pointer(), model_size,
+                                               MODEL_DOWNLOAD_CHUNK_SIZE, this_va->http_request_->get_timeout());
     size_t model_bytes = container->get_bytes_read();
     container->end();
     if (model_read.status != http_request::HttpReadStatus::OK || model_bytes != model_size) {
